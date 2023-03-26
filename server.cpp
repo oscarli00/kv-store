@@ -64,7 +64,8 @@ static bool read_into_buffer(Conn &conn) {
 }
 
 static void handle_request(Conn &conn) {
-  while (read_into_buffer(conn)) {};
+  while (read_into_buffer(conn)) {
+  };
 }
 
 static bool write_from_buffer(Conn &conn) {
@@ -73,7 +74,8 @@ static bool write_from_buffer(Conn &conn) {
 }
 
 static void handle_response(Conn &conn) {
-  while (write_from_buffer(conn));
+  while (write_from_buffer(conn))
+    ;
 }
 
 static void accept_conn(int fd, std::vector<std::unique_ptr<Conn>> &conn_map) {
@@ -133,7 +135,7 @@ int main() {
   while (true) {
     poll_args.clear();
     // Add the listening fd first
-    poll_args.emplace_back(fd, POLLIN, 0);
+    poll_args.push_back({fd, POLLIN, 0});
 
     for (auto &conn : conn_map) {
       if (!conn) {
@@ -141,9 +143,9 @@ int main() {
       }
 
       // Store the polled information of connections
-      poll_args.emplace_back(
-          conn->fd,
-          POLLERR | ((conn->state == CONN_STATE::REQ) ? POLLIN : POLLOUT), 0);
+      pollfd pfd{conn->fd, POLLERR, 0};
+      pfd.events |= (conn->state == CONN_STATE::REQ) ? POLLIN : POLLOUT;
+      poll_args.push_back(pfd);
     }
 
     int ev{poll(poll_args.data(), (nfds_t)poll_args.size(), TIMEOUT)};
