@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -40,7 +41,8 @@ struct Conn {
 static void die(const std::string &msg);
 static void check_errno(Conn &conn, const std::string &op);
 
-static void accept_conn(int fd, std::vector<std::unique_ptr<Conn>> &conn_map);
+static void accept_conn(int listenfd, int epollfd,
+                        std::vector<std::unique_ptr<Conn>> &conn_map);
 static void set_fd_nonblocking(int fd);
 
 static void read_request(Conn &conn);
@@ -138,7 +140,8 @@ static bool handle_request(Conn &conn) {
   printf("Client message: %.*s\n", len, &conn.rbuf[constants::MSG_LEN_BYTES]);
 
   memcpy(&conn.wbuf[0], &len, constants::MSG_LEN_BYTES);
-  memcpy(&conn.wbuf[constants::MSG_LEN_BYTES], &conn.rbuf[constants::MSG_LEN_BYTES], len);
+  memcpy(&conn.wbuf[constants::MSG_LEN_BYTES],
+         &conn.rbuf[constants::MSG_LEN_BYTES], len);
   conn.wbuf_size = constants::MSG_LEN_BYTES + len;
 
   size_t rem{conn.rbuf_size - constants::MSG_LEN_BYTES - len};
@@ -187,10 +190,11 @@ static bool write_from_buffer(Conn &conn) {
   return true;
 }
 
-static void accept_conn(int fd, std::vector<std::unique_ptr<Conn>> &conn_map) {
+static void accept_conn(int listenfd, int epollfd,
+                        std::vector<std::unique_ptr<Conn>> &conn_map) {
   sockaddr_in client_addr{};
   socklen_t len{sizeof(client_addr)};
-  int connfd{accept(fd, (sockaddr *)&client_addr, &len)};
+  int connfd{accept(listenfd, (sockaddr *)&client_addr, &len)};
   if (connfd < 0) {
     std::cerr << "accept() error\n";
     return;
@@ -206,91 +210,108 @@ static void accept_conn(int fd, std::vector<std::unique_ptr<Conn>> &conn_map) {
   conn->fd = connfd;
   conn->state = CONN_STATE::REQ;
 
+  epoll_event ev{};
+  ev.events = conn->state == CONN_STATE::REQ ? EPOLLIN : EPOLLOUT;
+  ev.data.fd = conn->fd;
+  if (epoll_ctl(epollfd, EPOLL_CTL_ADD, conn->fd, &ev) < 0) {
+    die("epoll_ctl() failed to add new connection");
+  }
+
   if (conn_map.size() <= (size_t)conn->fd) {
     conn_map.resize(conn->fd + 1);
-    assert(!conn_map[conn->fd]);
-    conn_map[conn->fd] = std::move(conn);
   }
+  assert(!conn_map[conn->fd]);
+  conn_map[conn->fd] = std::move(conn);
 }
 
 int main() {
-  int fd{socket(AF_INET, SOCK_STREAM, 0)};
-  if (fd < 0) {
+  int listenfd{socket(AF_INET, SOCK_STREAM, 0)};
+  if (listenfd < 0) {
     die("socket() error");
   }
 
   // this is needed for most server applications
   int opt_val{1};
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt_val, sizeof(opt_val));
+  setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt_val, sizeof(opt_val));
 
   // bind
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = ntohs(1234);
   addr.sin_addr.s_addr = ntohl(0); // wildcard address 0.0.0.0
-  if (bind(fd, (const sockaddr *)&addr, sizeof(addr))) {
+  if (bind(listenfd, (const sockaddr *)&addr, sizeof(addr))) {
     die("bind() error");
   }
 
   // listen
-  if (listen(fd, SOMAXCONN)) {
+  if (listen(listenfd, SOMAXCONN)) {
     die("listen() error");
   }
 
-  set_fd_nonblocking(fd);
+  set_fd_nonblocking(listenfd);
+
+  int epollfd{epoll_create1(0)};
+  if (epollfd < 0) {
+    die("epoll_create1() error");
+  }
+
+  epoll_event accept{};
+  accept.events = EPOLLIN;
+  accept.data.fd = listenfd;
+  if (epoll_ctl(epollfd, EPOLL_CTL_ADD, listenfd, &accept) < 0) {
+    die("epoll_ctl() EPOLL_CTL_ADD");
+  }
 
   std::vector<std::unique_ptr<Conn>> conn_map;
-  std::vector<pollfd> poll_args;
+  epoll_event *events = new epoll_event[16 * 1024];
+  if (events == nullptr) {
+    die("Unable to allocate memory for epoll_events");
+  }
+  
   while (true) {
-    poll_args.clear();
-    // Add the listening fd first
-    poll_args.push_back({fd, POLLIN, 0});
-
-    for (auto &conn : conn_map) {
-      if (!conn) {
-        continue;
-      }
-
-      // Store the polled information of connections
-      pollfd pfd{conn->fd, POLLERR, 0};
-      pfd.events |= (conn->state == CONN_STATE::REQ) ? POLLIN : POLLOUT;
-      poll_args.push_back(pfd);
-    }
-
-    int ev{poll(poll_args.data(), (nfds_t)poll_args.size(), constants::TIMEOUT)};
-    if (ev == 0) {
+    int n{epoll_wait(epollfd, events, 16 * 1024, -1)};
+    if (n == 0) {
       die("poll() timed out");
-    } else if (ev < 0) {
+    } else if (n < 0) {
       die("poll() error");
     }
 
-    // Process active connections
-    for (size_t i = 1; i < poll_args.size(); i++) {
-      // Check if something happened in the connection
-      if (poll_args[i].revents) {
-        auto &conn = conn_map[poll_args[i].fd];
+    for (int i = 0; i < n; i++) {
+      if (events[i].data.fd == listenfd) {
+        // Check listening fd for new connections
+        accept_conn(listenfd, epollfd, conn_map);
+        continue;
+      }
 
-        switch (conn->state) {
-        case CONN_STATE::REQ:
-          // Read the request from the connection
-          read_request(*conn);
-          break;
-        case CONN_STATE::RES:
-          // Write the response back to the connection
-          write_response(*conn);
-          break;
-        case CONN_STATE::END:
-          // Close the connection
-          close(conn->fd);
-          conn.reset();
-          break;
+      auto &conn = conn_map[events[i].data.fd];
+      if (!conn) {
+        assert(0);
+      }
+
+      if (conn->state == CONN_STATE::REQ) {
+        read_request(*conn);
+      } else if (conn->state == CONN_STATE::RES) {
+        write_response(*conn);
+      } else {
+        die("not supposed to happen");
+      }
+
+      if (conn->state == CONN_STATE::END) {
+        // Close the connection
+        if (epoll_ctl(epollfd, EPOLL_CTL_DEL, conn->fd, nullptr) < 0) {
+          die("epoll_ctl() EPOLL_CTL_DEL");
+        }
+        close(conn->fd);
+        conn.reset();
+      } else {
+        // Update epoll event
+        epoll_event ev{};
+        ev.events = conn->state == CONN_STATE::REQ ? EPOLLIN : EPOLLOUT;
+        ev.data.fd = conn->fd;
+        if (epoll_ctl(epollfd, EPOLL_CTL_MOD, conn->fd, &ev) < 0) {
+          die("epoll_ctl() EPOLL_CTL_MOD");
         }
       }
-    }
-
-    // Check listening fd for new connections
-    if (poll_args[0].revents) {
-      accept_conn(fd, conn_map);
     }
   }
 
