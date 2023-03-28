@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <asm-generic/errno-base.h>
 #include <cassert>
+#include <cstdint>
 #include <errno.h>
 #include <fcntl.h>
 #include <iostream>
@@ -20,8 +21,6 @@
 
 #include "constants.h"
 
-enum class CONN_STATE { REQ, RES, END };
-
 struct Status {
   bool req{false};
   bool res{false};
@@ -29,31 +28,33 @@ struct Status {
 
 struct Conn {
   int fd{-1};
-  // CONN_STATE state{CONN_STATE::END};
+
+  // Stores info of what events to poll for
   Status state{};
 
   // Read buffer
   // Stores the data of client requests
-  uint8_t rbuf[constants::MSG_BUFFER_SIZE];
+  uint8_t rbuf[constants::READ_BUFFER_SIZE];
   size_t rbuf_size{};
   size_t rbuf_read{};
 
   // Write buffer
   // Stores the data for responses
-  uint8_t wbuf[constants::MSG_BUFFER_SIZE];
+  uint8_t wbuf[constants::WRITE_BUFFER_SIZE];
   size_t wbuf_size{};
   size_t wbuf_sent{};
 };
 
 static void die(const std::string &msg);
-static void check_EAGAIN(Conn &conn, const std::string &op);
+static void check_err(Conn &conn, const std::string &op);
 
 static void accept_conn(int listenfd, int epollfd,
                         std::vector<std::unique_ptr<Conn>> &conn_map);
 static void set_fd_nonblocking(int fd);
 
 static void read_into_buffer(Conn &conn);
-static void handle_request(Conn &conn);
+static void parse_request(Conn &conn);
+static int create_response(Conn &conn, uint32_t len);
 
 static void write_from_buffer(Conn &conn);
 
@@ -62,7 +63,7 @@ static void die(const std::string &msg) {
   abort();
 }
 
-static void check_EAGAIN(Conn &conn, const std::string &op) {
+static void check_err(Conn &conn, const std::string &op) {
   // EAGAIN means that the requested operation would have blocked. Other errors
   // mean something wrong happened with the operation
   if (errno != EAGAIN) {
@@ -111,7 +112,7 @@ static void read_into_buffer(Conn &conn) {
   } while (ret < 0 && errno == EINTR); // Retry if interrupted
 
   if (ret < 0) {
-    check_EAGAIN(conn, "recv()");
+    check_err(conn, "recv()");
     return;
   }
 
@@ -126,13 +127,13 @@ static void read_into_buffer(Conn &conn) {
   }
 
   conn.rbuf_size += (size_t)ret;
-  handle_request(conn);
+  parse_request(conn);
 
   return;
 }
 
-static void handle_request(Conn &conn) {
-  assert(conn.rbuf_read==0);
+static void parse_request(Conn &conn) {
+  assert(conn.rbuf_read == 0);
 
   while (conn.rbuf_size - conn.rbuf_read >= constants::MSG_LEN_BYTES) {
     uint32_t len;
@@ -143,47 +144,70 @@ static void handle_request(Conn &conn) {
       break;
     }
     if (constants::MSG_LEN_BYTES + len > conn.rbuf_size - conn.rbuf_read) {
-      // Buffer hasn't received the full request yet, try again later
+      // Buffer hasn't received the whole request yet, try again later
       break;
     }
 
-    printf("Client message: %.*s\n", len,
-            &conn.rbuf[conn.rbuf_read + constants::MSG_LEN_BYTES]);
-
-    // Copy response length into write buffer
-    memcpy(&conn.wbuf[conn.wbuf_size], &len, constants::MSG_LEN_BYTES);
-    // Copy response message into write buffer
-    memcpy(&conn.wbuf[conn.wbuf_size + constants::MSG_LEN_BYTES],
-            &conn.rbuf[conn.rbuf_read + constants::MSG_LEN_BYTES], len);
-    conn.wbuf_size += constants::MSG_LEN_BYTES + len;
-    conn.rbuf_read += constants::MSG_LEN_BYTES + len;
-    conn.state.res = true;
+    if (create_response(conn, len)) {
+      break;
+    }
   }
 }
 
-// Returns true if there is still more data to be sent from the buffer, false
-// otherwise
+// Writes the response into the connection's write buffer. Returns 0 if
+// successful, -1 if there is insufficient space in the buffer.
+static int create_response(Conn &conn, uint32_t len) {
+  assert(sizeof(len) == constants::MSG_LEN_BYTES);
+
+  printf("Client message: %.*s\n", len,
+         &conn.rbuf[conn.rbuf_read + constants::MSG_LEN_BYTES]);
+
+  if (conn.wbuf_size + constants::MSG_LEN_BYTES + len >
+      constants::WRITE_BUFFER_SIZE) {
+    std::cerr << "no more space in write buffer\n";
+    // Do not allow any more requests to be received.
+    conn.state = {.req = false, .res = true};
+    return -1;
+  }
+
+  // Copy response length into write buffer
+  memcpy(&conn.wbuf[conn.wbuf_size], &len, constants::MSG_LEN_BYTES);
+  // Copy response message into write buffer
+  memcpy(&conn.wbuf[conn.wbuf_size + constants::MSG_LEN_BYTES],
+         &conn.rbuf[conn.rbuf_read + constants::MSG_LEN_BYTES], len);
+
+  conn.wbuf_size += constants::MSG_LEN_BYTES + len;
+  conn.rbuf_read += constants::MSG_LEN_BYTES + len;
+  conn.state.res = true;
+
+  return 0;
+}
+
+// Send as much as we can from the write buffer
 static void write_from_buffer(Conn &conn) {
   ssize_t ret{};
-
   do {
     size_t rem = conn.wbuf_size - conn.wbuf_sent;
     ret = send(conn.fd, &conn.wbuf[conn.wbuf_sent], rem, 0);
   } while (ret < 0 && errno == EINTR);
 
   if (ret < 0) {
-    check_EAGAIN(conn, "send()");
+    check_err(conn, "send()");
     return;
   }
 
   conn.wbuf_sent += ret;
 
   if (conn.wbuf_sent == conn.wbuf_size) {
-    // Finished sending response
+    // Finished sending all responses
     conn.state.res = false;
     conn.wbuf_sent = 0;
     conn.wbuf_size = 0;
   }
+
+  // Enable receiving requests again. (Would have only been disabled if the
+  // write buffer ran out of space)
+  conn.state.req = true;
 }
 
 static void accept_conn(int listenfd, int epollfd,
@@ -263,8 +287,8 @@ int main() {
     die("epoll_ctl() EPOLL_CTL_ADD");
   }
 
-  // Map fd value to the respective Conn object
-  std::vector<std::unique_ptr<Conn>> conn_map; 
+  // Maps fd value to the respective Conn object
+  std::vector<std::unique_ptr<Conn>> conn_map;
 
   epoll_event *events =
       new epoll_event[constants::EVENT_BUFFER_SIZE]; // TODO: change to
@@ -289,10 +313,10 @@ int main() {
       }
 
       auto &conn = conn_map[events[i].data.fd];
-      if (!conn) {
-        assert(0);
-      }
+      assert(conn);
 
+      // Always prioritise sending from the write buffer first in case it is
+      // full.
       if (events[i].events & EPOLLOUT) {
         write_from_buffer(*conn);
       } else if (events[i].events & EPOLLIN) {
