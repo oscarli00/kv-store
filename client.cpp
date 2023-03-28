@@ -50,14 +50,14 @@ static int32_t send_request(int fd, const char *text) {
     return -1;
   }
 
-  char wbuf[constants::BUFFER_SIZE];
+  char wbuf[constants::MSG_BUFFER_SIZE];
   memcpy(wbuf, &len, constants::MSG_LEN_BYTES); // assume little endian
   memcpy(&wbuf[constants::MSG_LEN_BYTES], text, len);
   return write_all(fd, wbuf, constants::MSG_LEN_BYTES + len);
 }
 
 static int32_t read_response(int fd) {
-  char rbuf[constants::BUFFER_SIZE + 1]; // Extra byte for null terminator
+  char rbuf[constants::MSG_BUFFER_SIZE + 1]; // Extra byte for null terminator
   errno = 0;
   int32_t err = read_full(fd, rbuf, constants::MSG_LEN_BYTES);
   if (err) {
