@@ -30,6 +30,7 @@ struct Conn {
   // Stores the data of client requests
   uint8_t rbuf[constants::BUFFER_SIZE];
   size_t rbuf_size{};
+  size_t rbuf_read{};
 
   // Write buffer
   // Stores the data for responses
@@ -39,17 +40,15 @@ struct Conn {
 };
 
 static void die(const std::string &msg);
-static void check_errno(Conn &conn, const std::string &op);
+static void check_EAGAIN(Conn &conn, const std::string &op);
 
 static void accept_conn(int listenfd, int epollfd,
                         std::vector<std::unique_ptr<Conn>> &conn_map);
 static void set_fd_nonblocking(int fd);
 
-static void read_request(Conn &conn);
-static bool handle_request(Conn &conn);
 static bool read_into_buffer(Conn &conn);
+static bool handle_request(Conn &conn);
 
-static void write_response(Conn &conn);
 static bool write_from_buffer(Conn &conn);
 
 static void die(const std::string &msg) {
@@ -57,16 +56,16 @@ static void die(const std::string &msg) {
   abort();
 }
 
-static void check_errno(Conn &conn, const std::string &op) {
-  // EAGAIN means that the requested operation would block. Other errors mean
-  // something wrong happened with the operation
+static void check_EAGAIN(Conn &conn, const std::string &op) {
+  // EAGAIN means that the requested operation would have blocked. Other errors
+  // mean something wrong happened with the operation
   if (errno != EAGAIN) {
     std::cerr << op << " error\n";
     conn.state = CONN_STATE::END;
   }
 }
 
-// Makes it so that send() and recv() are nonblocking
+// Set the connection to be nonblocking
 static void set_fd_nonblocking(int fd) {
   errno = 0;
   int flags{fcntl(fd, F_GETFL, 0)};
@@ -84,31 +83,37 @@ static void set_fd_nonblocking(int fd) {
   }
 }
 
-static void read_request(Conn &conn) {
-  while (read_into_buffer(conn)) {
-  };
-}
-
 // Returns true if there is still more data to receive into the buffer, false
 // otherwise
 static bool read_into_buffer(Conn &conn) {
   ssize_t ret{0};
 
+  if (conn.rbuf_read > 0) {
+    // Try to clear read buffer of requests that have already been processed
+    size_t rem{conn.rbuf_size - conn.rbuf_read};
+    if (rem) {
+      memmove(conn.rbuf, &conn.rbuf[conn.rbuf_read], rem);
+    }
+    conn.rbuf_size = rem;
+    conn.rbuf_read = 0;
+  }
+
+  // Read as much data as we can without blocking
   do {
     size_t rem{sizeof(conn.rbuf) - conn.rbuf_size};
     ret = recv(conn.fd, &conn.rbuf[conn.rbuf_size], rem, 0);
   } while (ret < 0 && errno == EINTR); // Retry if interrupted
 
   if (ret < 0) {
-    check_errno(conn, "recv()");
+    check_EAGAIN(conn, "recv()");
     return false;
   }
 
   if (ret == 0) {
     if (conn.rbuf_size > 0) {
-      std::cerr << "unexpected EOF\n";
+      std::cerr << "Unexpected EOF. Closing client connection\n";
     } else {
-      std::cerr << "eof\n";
+      std::cerr << "EOF. Closing client connection\n";
     }
     conn.state = CONN_STATE::END;
     return false;
@@ -116,49 +121,45 @@ static bool read_into_buffer(Conn &conn) {
 
   conn.rbuf_size += (size_t)ret;
   while (handle_request(conn)) {
-  }
+  };
+
   return conn.state == CONN_STATE::REQ;
 }
 
 static bool handle_request(Conn &conn) {
-  if (conn.rbuf_size < constants::MSG_LEN_BYTES) {
+  if (conn.rbuf_size - conn.rbuf_read < constants::MSG_LEN_BYTES) {
     return false;
   }
 
   uint32_t len;
-  memcpy(&len, &conn.rbuf[0], constants::MSG_LEN_BYTES);
+  memcpy(&len, &conn.rbuf[conn.rbuf_read], constants::MSG_LEN_BYTES);
   if (len > constants::MAX_MSG_SIZE) {
-    std::cerr << "Message too big\n";
+    std::cerr << "Message too big. Closing client connection\n";
     conn.state = CONN_STATE::END;
     return false;
   }
-  if (constants::MSG_LEN_BYTES + len > conn.rbuf_size) {
-    // Not enough room in the buffer
+  if (constants::MSG_LEN_BYTES + len > conn.rbuf_size - conn.rbuf_read) {
+    // Buffer hasn't received the full request yet, try again later
     return false;
   }
 
-  printf("Client message: %.*s\n", len, &conn.rbuf[constants::MSG_LEN_BYTES]);
+  printf("Client message: %.*s\n", len,
+         &conn.rbuf[conn.rbuf_read + constants::MSG_LEN_BYTES]);
 
+  // Copy response length into write buffer
   memcpy(&conn.wbuf[0], &len, constants::MSG_LEN_BYTES);
+  // Copy response message into write buffer
   memcpy(&conn.wbuf[constants::MSG_LEN_BYTES],
-         &conn.rbuf[constants::MSG_LEN_BYTES], len);
+         &conn.rbuf[conn.rbuf_read + constants::MSG_LEN_BYTES], len);
   conn.wbuf_size = constants::MSG_LEN_BYTES + len;
 
-  size_t rem{conn.rbuf_size - constants::MSG_LEN_BYTES - len};
-  if (rem) {
-    memmove(conn.rbuf, &conn.rbuf[constants::MSG_LEN_BYTES + len], rem);
-  }
-  conn.rbuf_size = rem;
+  conn.rbuf_read += constants::MSG_LEN_BYTES + len;
 
   conn.state = CONN_STATE::RES;
-  write_response(conn);
-
-  return conn.state == CONN_STATE::REQ;
-}
-
-static void write_response(Conn &conn) {
   while (write_from_buffer(conn)) {
   };
+
+  return conn.state == CONN_STATE::REQ;
 }
 
 // Returns true if there is still more data to be sent from the buffer, false
@@ -172,7 +173,7 @@ static bool write_from_buffer(Conn &conn) {
   } while (ret < 0 && errno == EINTR);
 
   if (ret < 0) {
-    check_errno(conn, "send()");
+    check_EAGAIN(conn, "send()");
     return false;
   }
 
@@ -263,11 +264,12 @@ int main() {
   }
 
   std::vector<std::unique_ptr<Conn>> conn_map;
-  epoll_event *events = new epoll_event[16 * 1024];
+  epoll_event *events =
+      new epoll_event[16 * 1024]; // TODO: change to unique_ptr
   if (events == nullptr) {
     die("Unable to allocate memory for epoll_events");
   }
-  
+
   while (true) {
     int n{epoll_wait(epollfd, events, 16 * 1024, -1)};
     if (n == 0) {
@@ -289,9 +291,11 @@ int main() {
       }
 
       if (conn->state == CONN_STATE::REQ) {
-        read_request(*conn);
+        while (read_into_buffer(*conn)) {
+        };
       } else if (conn->state == CONN_STATE::RES) {
-        write_response(*conn);
+        while (write_from_buffer(*conn)) {
+        };
       } else {
         die("not supposed to happen");
       }
