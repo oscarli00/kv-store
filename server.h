@@ -1,11 +1,11 @@
 #ifndef SERVER_H
 #define SERVER_H
 
-#include "constants.h"
-#include <cstdint>
 #include <memory>
 #include <sys/epoll.h>
 #include <vector>
+
+#include "constants.h"
 
 struct Status {
   bool req{false};

@@ -1,26 +1,42 @@
-#include <arpa/inet.h>
+#include "client.h"
+
 #include <cassert>
 #include <cstdint>
-#include <errno.h>
+#include <cstring>
 #include <iostream>
 #include <netinet/ip.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
 #include <unistd.h>
 
 #include "constants.h"
+#include "utils.h"
 
-static void die(const char *msg) {
-  std::cerr << "Error " << errno << ": " << msg << "\n";
-  abort();
+Client::Client() {
+  init();
 }
 
-static int32_t read_full(int fd, char *buf, size_t n) {
+Client::~Client() {
+  close(fd_);
+}
+
+void Client::init() {
+  fd_ = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd_ < 0) {
+    die("socket()");
+  }
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = ntohs(1234);
+  addr.sin_addr.s_addr = ntohl(INADDR_LOOPBACK); // 127.0.0.1
+  int rv{connect(fd_, (const sockaddr *)&addr, sizeof(addr))};
+  if (rv) {
+    die("connect() error");
+  }
+}
+
+int32_t Client::read_full(char *buf, size_t n) {
   while (n > 0) {
-    ssize_t ret = recv(fd, buf, n, 0);
+    ssize_t ret = recv(fd_, buf, n, 0);
     if (ret <= 0) {
       return -1; // error, or unexpected EOF
     }
@@ -31,9 +47,9 @@ static int32_t read_full(int fd, char *buf, size_t n) {
   return 0;
 }
 
-static int32_t write_all(int fd, const char *buf, size_t n) {
+int32_t Client::write_all(const char *buf, size_t n) {
   while (n > 0) {
-    ssize_t ret = send(fd, buf, n, 0);
+    ssize_t ret = send(fd_, buf, n, 0);
     if (ret <= 0) {
       return -1; // error
     }
@@ -44,7 +60,7 @@ static int32_t write_all(int fd, const char *buf, size_t n) {
   return 0;
 }
 
-static int32_t send_request(int fd, const char *text) {
+int32_t Client::send_request(const char *text) {
   uint32_t len{(uint32_t)strlen(text)};
   if (len > constants::MAX_MSG_SIZE) {
     return -1;
@@ -53,13 +69,14 @@ static int32_t send_request(int fd, const char *text) {
   char wbuf[constants::MSG_LEN_BYTES + constants::MAX_MSG_SIZE];
   memcpy(wbuf, &len, constants::MSG_LEN_BYTES); // assume little endian
   memcpy(&wbuf[constants::MSG_LEN_BYTES], text, len);
-  return write_all(fd, wbuf, constants::MSG_LEN_BYTES + len);
+  return write_all(wbuf, constants::MSG_LEN_BYTES + len);
 }
 
-static int32_t read_response(int fd) {
-  char rbuf[constants::MSG_LEN_BYTES + constants::MAX_MSG_SIZE + 1]; // Extra byte for null terminator
+int32_t Client::read_response() {
+  char rbuf[constants::MSG_LEN_BYTES + constants::MAX_MSG_SIZE +
+            1]; // Extra byte for null terminator
   errno = 0;
-  int32_t err = read_full(fd, rbuf, constants::MSG_LEN_BYTES);
+  int32_t err{read_full(rbuf, constants::MSG_LEN_BYTES)};
   if (err) {
     if (errno == 0) {
       std::cerr << "EOF\n";
@@ -76,7 +93,7 @@ static int32_t read_response(int fd) {
     return -1;
   }
 
-  err = read_full(fd, &rbuf[constants::MSG_LEN_BYTES], len);
+  err = read_full(&rbuf[constants::MSG_LEN_BYTES], len);
   if (err) {
     std::cerr << "read() error\n";
     return err;
@@ -88,34 +105,19 @@ static int32_t read_response(int fd) {
 }
 
 int main() {
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) {
-    die("socket()");
-  }
+  Client client;
 
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = ntohs(1234);
-  addr.sin_addr.s_addr = ntohl(INADDR_LOOPBACK); // 127.0.0.1
-  int rv{connect(fd, (const sockaddr *)&addr, sizeof(addr))};
-  if (rv) {
-    die("connect() error");
-  }
-
-  // multiple pipelined requests
   const char *query_list[3] = {"hello1", "hello2", "hello3"};
   for (size_t i = 0; i < 3; ++i) {
-    if (send_request(fd, query_list[i])) {
-      goto L_DONE;
+    if (client.send_request(query_list[i])) {
+      return 0;
     }
   }
   for (size_t i = 0; i < 3; ++i) {
-    if (read_response(fd)) {
-      goto L_DONE;
+    if (client.read_response()) {
+      return 0;
     }
   }
 
-L_DONE:
-  close(fd);
   return 0;
 }

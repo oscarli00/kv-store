@@ -1,7 +1,6 @@
 
 #include "utils.h"
 
-#include "server.h"
 #include <cerrno>
 #include <fcntl.h>
 #include <iostream>

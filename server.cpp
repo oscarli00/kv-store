@@ -1,24 +1,13 @@
 #include "server.h"
 
-#include <arpa/inet.h>
-#include <asm-generic/errno-base.h>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
-#include <errno.h>
+#include <cstring>
 #include <fcntl.h>
 #include <iostream>
-#include <memory>
 #include <netinet/ip.h>
-#include <ostream>
-#include <poll.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/epoll.h>
-#include <sys/poll.h>
-#include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
 
