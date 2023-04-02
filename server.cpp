@@ -1,12 +1,15 @@
 #include "server.h"
 
 #include <cassert>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <netinet/in.h>
 #include <netinet/ip.h>
+#include <strings.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 #include <vector>
@@ -14,7 +17,14 @@
 #include "constants.h"
 #include "utils.h"
 
-Server::Server() { init(); }
+const size_t k_max_args = 1024;
+
+Server::Server(in_addr_t ip, in_port_t port) {
+  ip_ = ip;
+  port_ = port;
+  init();
+  std::cout << "Server listening on " << ip_ << ":" << port_ << "\n";
+}
 
 Server::~Server() {
   close(listen_fd_);
@@ -47,8 +57,8 @@ void Server::create_socket() {
 void Server::bind_socket() {
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
-  addr.sin_port = ntohs(1234);
-  addr.sin_addr.s_addr = ntohl(0); // wildcard address 0.0.0.0
+  addr.sin_port = port_;
+  addr.sin_addr.s_addr = ip_;
   if (bind(listen_fd_, (const sockaddr *)&addr, sizeof(addr))) {
     die("bind() error");
   }
@@ -83,9 +93,9 @@ void Server::setup_epoll() {
 void Server::loop() {
   int n{epoll_wait(epoll_fd_, events_, constants::EVENT_BUFFER_SIZE, -1)};
   if (n == 0) {
-    die("poll() timed out");
+    die("epoll_wait() timed out");
   } else if (n < 0) {
-    die("poll() error");
+    die("epoll_wait() error");
   }
 
   for (int i = 0; i < n; i++) {
@@ -201,11 +211,11 @@ void Server::read_into_buffer(Conn &conn) {
     conn.state = {.req = false, .res = false};
   } else {
     conn.rbuf_size += (size_t)ret;
-    parse_request(conn);
+    read_request(conn);
   }
 }
 
-void Server::parse_request(Conn &conn) {
+void Server::read_request(Conn &conn) {
   assert(conn.rbuf_read == 0);
 
   while (conn.rbuf_size - conn.rbuf_read >= constants::MSG_LEN_BYTES) {
@@ -215,44 +225,126 @@ void Server::parse_request(Conn &conn) {
     if (len > constants::MAX_MSG_SIZE) {
       std::cerr << "Message too big. Closing client connection\n";
       conn.state = {.req = false, .res = false};
-      break;
+      return;
     }
 
     if (constants::MSG_LEN_BYTES + len > conn.rbuf_size - conn.rbuf_read) {
       // Read buffer hasn't received the whole request yet, try again later
-      break;
+      return;
     }
 
-    if (create_response(conn, len)) {
-      break;
+    uint32_t argc{};
+    memcpy(&argc, &conn.rbuf[conn.rbuf_read + constants::MSG_LEN_BYTES],
+           constants::ARG_LEN_BYTES);
+    if (argc > k_max_args) {
+      std::cerr << "Too many arguments. Closing client connection\n";
+      conn.state = {.req = false, .res = false};
+      return;
     }
+
+    std::vector<std::string> cmd;
+    size_t pos{conn.rbuf_read + constants::MSG_LEN_BYTES +
+               constants::MSG_NSTR_BYTES};
+    size_t end_pos{conn.rbuf_read + constants::MSG_LEN_BYTES + len};
+    while (argc--) {
+      if (pos + constants::ARG_LEN_BYTES > end_pos) {
+        std::cerr << "Corrupted request. Closing client connection\n";
+        conn.state = {.req = false, .res = false};
+        return;
+      }
+      uint32_t sz{};
+      memcpy(&sz, &conn.rbuf[pos], constants::ARG_LEN_BYTES);
+
+      if (pos + constants::ARG_LEN_BYTES + sz > end_pos) {
+        std::cerr << "Corrupted request. Closing client connection\n";
+        conn.state = {.req = false, .res = false};
+        return;
+      }
+      cmd.emplace_back((char *)&conn.rbuf[pos + constants::ARG_LEN_BYTES], sz);
+
+      pos += constants::ARG_LEN_BYTES + sz;
+    }
+    if (pos != end_pos) {
+      std::cerr << "Corrupted request. Closing client connection\n";
+      conn.state = {.req = false, .res = false};
+      return;
+    }
+
+    if (do_cmd(conn, cmd)) {
+      return;
+    }
+
+    conn.rbuf_read = pos;
   }
+}
+
+int Server::do_cmd(Conn &conn, const std::vector<std::string> &cmd) {
+  if (cmd.size() == 2 && strn_equals(cmd[0], "get")) {
+    return cmd_get(conn, cmd[1]);
+  }
+  if (cmd.size() == 3 && strn_equals(cmd[0], "set")) {
+    return cmd_set(conn, cmd[1], cmd[2]);
+  }
+  if (cmd.size() == 2 && strn_equals(cmd[0], "del")) {
+    return cmd_del(conn, cmd[1]);
+  }
+  return create_response(conn, "Invalid command");
+}
+
+int Server::cmd_get(Conn &conn, const std::string &key) {
+  const auto &pair{db_.find(key)};
+  return pair == db_.end() ? create_response(conn, "Key not found")
+                           : create_response(conn, "Val: " + pair->second);
+}
+
+int Server::cmd_set(Conn &conn, const std::string &key,
+                    const std::string &val) {
+  db_[key] = val;
+  return create_response(conn, "Set key: " + key + " val: " + val);
+}
+
+int Server::cmd_del(Conn &conn, const std::string &key) {
+  const auto &pair{db_.find(key)};
+  if (pair == db_.end()) {
+    return create_response(conn, "Key not found");
+  }
+  db_.erase(pair);
+  return create_response(conn, "Deleted key: " + key);
 }
 
 // Writes the response into the connection's write buffer. Returns 0 if
 // successful, -1 if there is insufficient space in the buffer.
-int Server::create_response(Conn &conn, uint32_t len) {
-  assert(sizeof(len) == constants::MSG_LEN_BYTES);
-
-  printf("Client message: %.*s\n", len,
-         &conn.rbuf[conn.rbuf_read + constants::MSG_LEN_BYTES]);
+//
+// Note: try to create the response first before doing the command in case the
+// write buffer is full
+int Server::create_response(Conn &conn, const std::string &str) {
+  size_t len{str.size()};
 
   if (conn.wbuf_size + constants::MSG_LEN_BYTES + len >
       constants::WRITE_BUFFER_SIZE) {
-    std::cerr << "no more space in write buffer\n";
-    // Do not allow any more requests to be received.
-    conn.state = {.req = false, .res = true};
-    return -1;
+    // Try to clear up some space in the write buffer
+    size_t rem = conn.wbuf_size - conn.wbuf_sent;
+    memmove(conn.wbuf, &conn.wbuf[conn.wbuf_sent], rem);
+    conn.wbuf_size = rem;
+    conn.wbuf_sent = 0;
+
+    // If there is still not enough space then return -1
+    if (conn.wbuf_size + constants::MSG_LEN_BYTES + len >
+        constants::WRITE_BUFFER_SIZE) {
+      std::cerr << "no more space in write buffer\n";
+      // Do not allow any more requests to be received.
+      conn.state = {.req = false, .res = true};
+      return -1;
+    }
   }
 
   // Copy response length into write buffer
   memcpy(&conn.wbuf[conn.wbuf_size], &len, constants::MSG_LEN_BYTES);
   // Copy response message into write buffer
-  memcpy(&conn.wbuf[conn.wbuf_size + constants::MSG_LEN_BYTES],
-         &conn.rbuf[conn.rbuf_read + constants::MSG_LEN_BYTES], len);
+  memcpy(&conn.wbuf[conn.wbuf_size + constants::MSG_LEN_BYTES], str.c_str(),
+         len);
 
   conn.wbuf_size += constants::MSG_LEN_BYTES + len;
-  conn.rbuf_read += constants::MSG_LEN_BYTES + len;
   conn.state.res = true;
 
   return 0;
@@ -275,14 +367,13 @@ void Server::write_from_buffer(Conn &conn) {
 
   if (conn.wbuf_sent == conn.wbuf_size) {
     // Finished sending all responses
-    conn.state.res = false;
     conn.wbuf_sent = 0;
     conn.wbuf_size = 0;
+    conn.state.res = false;
+    // Enable receiving requests again. (Would have only been disabled if the
+    // write buffer ran out of space)
+    conn.state.req = true;
   }
-
-  // Enable receiving requests again. (Would have only been disabled if the
-  // write buffer ran out of space)
-  conn.state.req = true;
 }
 
 void Server::check_err(Conn &conn, const std::string &op) {
@@ -295,7 +386,10 @@ void Server::check_err(Conn &conn, const std::string &op) {
 }
 
 int main() {
-  Server sv;
+  // wildcard address 0.0.0.0
+  // port 1234
+  Server sv{ntohl(INADDR_ANY), ntohs(1234)};
+
   while (true) {
     sv.loop();
   }

@@ -17,7 +17,6 @@ void set_fd_nonblocking(int fd) {
   int flags{fcntl(fd, F_GETFL, 0)};
   if (errno) {
     die("fcntl error");
-    return;
   }
 
   flags |= O_NONBLOCK;
@@ -29,3 +28,16 @@ void set_fd_nonblocking(int fd) {
   }
 }
 
+// Case-insensitive string comparison. Doesn't work with special characters
+bool strn_equals(std::string s1, std::string s2) {
+  if (s1.size() != s2.size()) {
+    return false;
+  }
+  for (auto c1 = s1.begin(), c2 = s2.begin(); c1 != s1.end(); ++c1, ++c2) {
+    if (tolower(static_cast<unsigned char>(*c1)) !=
+        tolower(static_cast<unsigned char>(*c2))) {
+      return false;
+    }
+  }
+  return true;
+}

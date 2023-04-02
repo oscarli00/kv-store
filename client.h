@@ -2,14 +2,18 @@
 #define CLIENT_H
 
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 class Client {
 public:
   Client();
   ~Client();
 
-  int32_t send_request(const char *text);
+  int32_t send_request(const std::vector<std::string> &args);
   int32_t read_response();
+
+  void loop();
 
 private:
   int fd_{};

@@ -2,7 +2,10 @@
 #define SERVER_H
 
 #include <memory>
+#include <netinet/in.h>
+#include <string>
 #include <sys/epoll.h>
+#include <unordered_map>
 #include <vector>
 
 #include "constants.h"
@@ -33,19 +36,26 @@ struct Conn {
 
 class Server {
 public:
-  Server();
+  Server(in_addr_t ip, in_port_t port);
   ~Server();
 
   void loop();
 
 private:
+  in_addr_t ip_;
+  in_port_t port_;
+
   // File descriptors
   int listen_fd_{};
   int epoll_fd_{};
 
   // Maps fd value to the respective Conn object
   std::vector<std::unique_ptr<Conn>> conn_map_{};
-  epoll_event *events_{}; // Maybe change to unique_ptr
+
+  // Epoll events buffer
+  epoll_event *events_{}; // Maybe change to vector
+
+  std::unordered_map<std::string, std::string> db_{};
 
   void init();
 
@@ -56,8 +66,14 @@ private:
 
   void accept_conn();
   void read_into_buffer(Conn &conn);
-  void parse_request(Conn &conn);
-  int create_response(Conn &conn, uint32_t len);
+  void read_request(Conn &conn);
+
+  int do_cmd(Conn &conn, const std::vector<std::string> &cmd);
+  int cmd_get(Conn &conn, const std::string &key);
+  int cmd_set(Conn &conn, const std::string &key, const std::string &val);
+  int cmd_del(Conn &conn, const std::string &key);
+
+  int create_response(Conn &conn, const std::string &str);
   void write_from_buffer(Conn &conn);
 
   void check_err(Conn &conn, const std::string &op);

@@ -2,21 +2,21 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <netinet/ip.h>
+#include <ostream>
+#include <sstream>
 #include <unistd.h>
+#include <vector>
 
 #include "constants.h"
 #include "utils.h"
 
-Client::Client() {
-  init();
-}
+Client::Client() { init(); }
 
-Client::~Client() {
-  close(fd_);
-}
+Client::~Client() { close(fd_); }
 
 void Client::init() {
   fd_ = socket(AF_INET, SOCK_STREAM, 0);
@@ -28,10 +28,21 @@ void Client::init() {
   addr.sin_family = AF_INET;
   addr.sin_port = ntohs(1234);
   addr.sin_addr.s_addr = ntohl(INADDR_LOOPBACK); // 127.0.0.1
-  int rv{connect(fd_, (const sockaddr *)&addr, sizeof(addr))};
-  if (rv) {
-    die("connect() error");
-  }
+  int rv{};
+  do {
+    rv = connect(fd_, (const sockaddr *)&addr, sizeof(addr));
+    if (rv) {
+      std::cout << "Failed to connect to server." << std::endl;
+      for (int i = 5; i > 0; i--) {
+        std::cout << "Retrying in " << i << " second" << (i > 1 ? "s" : "")
+                  << std::flush;
+        sleep(1);
+        std::cout << "\33[2K\r";
+      }
+      std::cout << "\n";
+    }
+  } while (rv);
+  std::cout << "Connected to server.\n";
 }
 
 int32_t Client::read_full(char *buf, size_t n) {
@@ -60,15 +71,29 @@ int32_t Client::write_all(const char *buf, size_t n) {
   return 0;
 }
 
-int32_t Client::send_request(const char *text) {
-  uint32_t len{(uint32_t)strlen(text)};
+int32_t Client::send_request(const std::vector<std::string> &args) {
+  uint32_t len{constants::MSG_NSTR_BYTES};
+  for (const auto &s : args) {
+    len += constants::ARG_LEN_BYTES + s.size();
+  }
   if (len > constants::MAX_MSG_SIZE) {
     return -1;
   }
 
+
   char wbuf[constants::MSG_LEN_BYTES + constants::MAX_MSG_SIZE];
-  memcpy(wbuf, &len, constants::MSG_LEN_BYTES); // assume little endian
-  memcpy(&wbuf[constants::MSG_LEN_BYTES], text, len);
+  memcpy(wbuf, &len, constants::MSG_LEN_BYTES);
+  uint32_t nstr{static_cast<uint32_t>(args.size())};
+  memcpy(&wbuf[constants::MSG_LEN_BYTES], &nstr, constants::MSG_NSTR_BYTES);
+
+  uint32_t pos{constants::MSG_LEN_BYTES + constants::MSG_NSTR_BYTES};
+  for (const auto &s : args) {
+    uint32_t sz{static_cast<uint32_t>(s.size())};
+    memcpy(&wbuf[pos], &sz, constants::ARG_LEN_BYTES);
+    memcpy(&wbuf[pos + constants::ARG_LEN_BYTES], s.data(), sz);
+    pos += constants::ARG_LEN_BYTES + sz;
+  }
+
   return write_all(wbuf, constants::MSG_LEN_BYTES + len);
 }
 
@@ -100,23 +125,28 @@ int32_t Client::read_response() {
   }
 
   rbuf[constants::MSG_LEN_BYTES + len] = '\0';
-  printf("server says: %s\n", &rbuf[constants::MSG_LEN_BYTES]);
+  printf("Server says>> %s\n", &rbuf[constants::MSG_LEN_BYTES]);
   return 0;
+}
+
+void Client::loop() {
+  std::cout << "Enter a command: ";
+  std::string in, s;
+  getline(std::cin, in);
+  std::istringstream stream(in);
+  std::vector<std::string> args;
+  while (stream >> s) {
+    args.push_back(s);
+  }
+  send_request(args);
+  read_response();
 }
 
 int main() {
   Client client;
 
-  const char *query_list[3] = {"hello1", "hello2", "hello3"};
-  for (size_t i = 0; i < 3; ++i) {
-    if (client.send_request(query_list[i])) {
-      return 0;
-    }
-  }
-  for (size_t i = 0; i < 3; ++i) {
-    if (client.read_response()) {
-      return 0;
-    }
+  while (true) {
+    client.loop();
   }
 
   return 0;
