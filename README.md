@@ -1,6 +1,6 @@
 # kv-store
 
-An in-memory key-value store inspired by Redis.
+An in-memory key-value store inspired by Redis and built using Linux TCP sockets and C++.
  
 ## Features
 
