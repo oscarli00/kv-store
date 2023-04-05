@@ -14,10 +14,10 @@ An in-memory key-value store inspired by Redis and built using Linux TCP sockets
 
 Note: the project requires Linux.
 
-1. Generate build (```cmake build```)
+1. Generate build folder (```cmake build```)
 1. Build using cmake (```cmake --build /build```)
 2. Run the server
-3. Run the client
+3. Run the client(s)
 4. Enter commands into the client terminal such as:
 
     - ```get [KEY]```
