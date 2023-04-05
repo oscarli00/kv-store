@@ -248,7 +248,7 @@ void Server::read_request(Conn &conn) {
     size_t end_pos{conn.rbuf_read + constants::MSG_LEN_BYTES + len};
     while (argc--) {
       if (pos + constants::ARG_LEN_BYTES > end_pos) {
-        std::cerr << "Corrupted request. Closing client connection\n";
+        std::cerr << "Invalid request, message larger than stated length). Closing client connection\n";
         conn.state = {.req = false, .res = false};
         return;
       }
@@ -256,7 +256,7 @@ void Server::read_request(Conn &conn) {
       memcpy(&sz, &conn.rbuf[pos], constants::ARG_LEN_BYTES);
 
       if (pos + constants::ARG_LEN_BYTES + sz > end_pos) {
-        std::cerr << "Corrupted request. Closing client connection\n";
+        std::cerr << "Invalid request, message larger than stated length). Closing client connection\n";
         conn.state = {.req = false, .res = false};
         return;
       }
@@ -294,11 +294,12 @@ int Server::do_cmd(Conn &conn, const std::vector<std::string> &cmd) {
 int Server::cmd_get(Conn &conn, const std::string &key) {
   const auto &pair{db_.find(key)};
   return pair == db_.end() ? create_response(conn, "Key not found")
-                           : create_response(conn, "Val: " + pair->second);
+                           : create_response(conn, pair->second);
 }
 
 int Server::cmd_set(Conn &conn, const std::string &key,
                     const std::string &val) {
+  // TODO have different messages for key created vs updated
   db_[key] = val;
   return create_response(conn, "Set key: " + key + " val: " + val);
 }
